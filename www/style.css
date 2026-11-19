@@ -1,0 +1,5 @@
+body { font-family: system-ui, sans-serif; background: #111827; color: #e5e7eb; margin: 0; }
+main { max-width: 40rem; margin: 3rem auto; padding: 0 1rem; }
+button { padding: .5rem 1rem; border-radius: .4rem; border: 0; background: #2563eb; color: #fff; cursor: pointer; }
+pre { background: #1f2937; padding: 1rem; border-radius: .4rem; min-height: 2rem; }
+a { color: #93c5fd; }
