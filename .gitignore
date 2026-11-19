@@ -1,0 +1,10 @@
+# 빌드 결과물
+/webserver
+/cgi-bin/
+/tests/test_http
+/tests/test_mime
+/tests/test_static
+/tests/test_proxy
+/tests/test_cgi
+*.o
+*.dSYM/
