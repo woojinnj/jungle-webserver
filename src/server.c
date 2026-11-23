@@ -107,6 +107,8 @@ static void serve_client(Pool *pool, int fd)
 
     HttpRequest request;
     int status = http_parse_request(head, &request);
+    fprintf(stderr, "[3 parse] status=%d method=%s path=%s\n",
+            status, request.method ? request.method : "-", request.path);
     if (status == 0)
         status = read_body(&stream, &request, read_by);
     Deadline write_by = deadline_after(RESPONSE_MS);
@@ -115,13 +117,18 @@ static void serve_client(Pool *pool, int fd)
     } else {
         Route *route = routes_match(pool->routes, request.path);
         if (route != NULL) {
-            proxy_serve(fd, route_pick(route), &request, write_by);
+            const Backend *backend = route_pick(route);
+            fprintf(stderr, "[4 proxy] %s -> %s\n", request.path, backend->authority);
+            proxy_serve(fd, backend, &request, write_by);
         } else if (strcmp(request.method, "GET") == 0) {
-            if (strcmp(request.path, "/echo") == 0)
+            if (strcmp(request.path, "/echo") == 0) {
                 http_send_error(fd, 405, "POST", write_by);
-            else
+            } else {
+                fprintf(stderr, "[4 static] 정적 파일 서빙: %s\n", request.path);
                 static_serve(fd, pool->root, request.path, write_by);
+            }
         } else if (strcmp(request.path, "/echo") == 0) {
+            fprintf(stderr, "[4 echo] POST 본문 %zu바이트 에코\n", request.headers.length);
             if (http_send_head(fd, 200, "application/octet-stream",
                                request.headers.length, write_by) == 0)
                 send_all(fd, request.body, request.headers.length, write_by);
@@ -148,11 +155,15 @@ static void *run_worker(void *arg)
         worker->client = fd;
         pthread_mutex_unlock(&pool->mutex);
 
+        fprintf(stderr, "[2 worker #%ld] 큐에서 fd=%d 꺼냄\n",
+                (long)(worker - pool->workers), fd);
         serve_client(pool, fd);
         shutdown(fd, SHUT_WR);
 
         pthread_mutex_lock(&pool->mutex);
         worker->client = -1;
+        fprintf(stderr, "[5 worker #%ld] 응답 끝, fd=%d 종료\n",
+                (long)(worker - pool->workers), fd);
         close(fd);
     }
     pthread_mutex_unlock(&pool->mutex);
@@ -275,6 +286,7 @@ static int accept_clients(int listener, int wake, Pool *pool)
             close(client);
             continue;
         }
+        fprintf(stderr, "[1 main] accept! client fd=%d -> 큐에 넣기\n", client);
         enqueue(pool, client);
     }
     return 0;
