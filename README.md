@@ -1,6 +1,82 @@
-# Jungle Web Server
+# 워커 8개가 모두 바쁘면, 아홉 번째 요청은 어떻게 될까?
 
-크래프톤 정글 웹 서버 프로젝트입니다. C11 표준 라이브러리와 POSIX 소켓 API로 HTTP 요청 파싱, 정적 파일 서빙, 동적 POST 처리, 리버스 프록시를 구현했습니다.
+**Jungle Web Server** · 외부 HTTP 라이브러리 없이 C11과 POSIX 소켓으로 만든 웹 서버·리버스 프록시
+
+## 1. 요청 하나가 백엔드에 도착하기까지
+
+```mermaid
+flowchart LR
+    M["메인 스레드<br/>poll · accept"] --> Q["대기열<br/>128칸"] --> W["워커 풀<br/>8개"]
+    W --> S["GET /<br/>정적 파일"]
+    W --> E["POST /echo<br/>본문 반환"]
+    W --> P["GET /api/items<br/>/api 규칙"]
+    P -->|이번 요청| A["백엔드 A"]
+    P -->|다음 요청| B["백엔드 B"]
+    classDef route fill:#dbeafe,stroke:#2563eb,color:#172554
+    class M,Q,W,P,A route
+```
+
+TCP에서는 헤더가 여러 번에 나뉘어 도착할 수 있다. 워커는 빈 줄까지 읽어 헤더의 끝을 찾고, `/api/items`와 일치하는 경로 규칙을 고른다. 같은 규칙의 백엔드는 **라운드 로빈**으로 선택한다.
+
+## 2. 느린 백엔드가 정적 파일 요청까지 기다리게 한다
+
+**고정 스레드 풀**은 요청마다 새 스레드를 만드는 비용을 줄이고, 동시에 일하는 워커 수를 8개로 제한한다. 정적 파일과 프록시 요청은 이 워커를 공유한다.
+
+```mermaid
+flowchart LR
+    M["메인 스레드<br/>poll · accept"] --> Q["대기열<br/>아홉 번째 연결 GET /"]
+    Q -. 워커가 비면 .-> W["워커 풀<br/>8개 모두 사용 중"]
+    W --> P["프록시 요청 8건<br/>백엔드 응답 대기"]
+    classDef waiting fill:#fef3c7,stroke:#b45309,color:#451a03
+    class Q,W,P waiting
+```
+
+| 새 연결이 들어온 순간 | 서버의 동작 |
+| --- | --- |
+| 워커 8개가 모두 백엔드 응답 대기 중 | 아홉 번째 연결은 큐에서 기다린다. **작은 HTML 파일을 요청해도 마찬가지다.** |
+| 워커 8개가 계속 바쁘고 대기열 128칸도 가득 참 | 메인 스레드가 새 연결에 `503 Service Unavailable` 전송을 시도하고 닫는다. |
+
+대기열은 순간적으로 몰린 연결을 받아 준다. 128칸의 상한은 서버가 대기 연결을 위해 열어 둘 소켓 수를 제한한다.
+
+## 3. 4초 뒤에 데이터가 오면 1초가 남는다
+
+```text
+0초                       4초                   5초
+워커가 요청을 읽기 시작 ──── 데이터 추가 도착 ───── 수신 마감
+                          └── 남은 시간 1초 ────┘
+```
+
+워커가 읽기 시작할 때 `CLOCK_MONOTONIC`으로 마감 시각을 정한다. 데이터가 더 도착해도 마감 시각은 그대로이고, `poll()`에는 남은 시간만 넘긴다. **큐 대기는 요청 수신 5초에 포함되지 않는다.**
+
+| 워커가 기다리는 구간 | 마감 시간 | 만료 시 동작 |
+| --- | --- | --- |
+| 클라이언트 요청 수신 | 헤더와 본문을 합쳐 5초 | `408 Request Timeout` |
+| 백엔드 연결 | 최대 2초 | `504 Gateway Timeout` |
+| 연결 후 백엔드 요청 송신·응답 수신 | 두 작업을 합쳐 5초 | 클라이언트 응답을 시작하기 전이면 `504`. 이미 중계 중이면 연결 종료 |
+
+## 4. 기다리는 도중에도 서버는 정리되는가?
+
+| 통합 테스트에서 만든 상황 | 확인한 결과 |
+| --- | --- |
+| 테스트 전용 경로 `/slow`의 백엔드가 연결만 받고 응답하지 않는다. | 클라이언트가 **`504`** 수신 |
+| `POST /echo`의 본문을 기다리는 중에 `SIGTERM`을 보낸다. | 서버 프로세스가 **2초 이내 정상 종료** |
+
+종료 신호를 받으면 시그널 핸들러가 파이프에 1바이트를 쓴다. 메인 스레드의 `poll()`이 깨어나면 서버는 새 연결 수락을 멈추고, 대기 연결과 처리 중인 연결을 정리한 뒤 워커 종료를 기다린다. [통합 테스트](tests/integration.py) · [종료 처리](src/server.c)
+
+**정적 파일 부하 측정** · macOS ARM64 루프백에서 `GET /` 2,000건, 동시성 64로 **43,685 req/s · 실패 0건**
+
+**메모리 검사** · ASan·UBSan 통과. 정적 파일·에코·프록시 반복 호출 후 macOS `leaks` 검사에서 **누수 0건**
+
+## 5. 아홉 번째 요청에 대한 답
+
+**아홉 번째 요청은 큐에서 기다리다가 먼저 비는 워커로 간다.** 큐의 크기는 *얼마나 많은 연결이 기다릴지* 제한하고, 각 I/O 단계의 마감 시간은 *워커가 얼마나 오래 기다릴지* 제한한다.
+
+현재 라운드 로빈은 응답이 없던 백엔드도 다시 선택한다. 다음 단계는 **헬스 체크**로 장애 백엔드를 잠시 제외해, 다음 워커까지 같은 곳에서 다시 5초를 기다리는 일을 줄이는 것이다.
+
+---
+
+<details>
+<summary><strong>개발자 참고 · 빌드, 프록시 실행 예시, 테스트 및 전체 측정 결과</strong></summary>
 
 ## 빌드 및 실행
 
@@ -25,14 +101,16 @@ curl -i --data-binary 'hello' http://127.0.0.1:8080/echo
 ```sh
 # 터미널 1
 backend_a=$(mktemp -d)
-printf 'backend A\n' > "$backend_a/api"
+mkdir "$backend_a/api"
+printf 'backend A\n' > "$backend_a/api/items"
 python3 -m http.server 8001 --bind 127.0.0.1 --directory "$backend_a"
 ```
 
 ```sh
 # 터미널 2
 backend_b=$(mktemp -d)
-printf 'backend B\n' > "$backend_b/api"
+mkdir "$backend_b/api"
+printf 'backend B\n' > "$backend_b/api/items"
 python3 -m http.server 8002 --bind 127.0.0.1 --directory "$backend_b"
 ```
 
@@ -43,9 +121,9 @@ python3 -m http.server 8002 --bind 127.0.0.1 --directory "$backend_b"
 
 ```sh
 # 터미널 4
-curl -fsS http://127.0.0.1:8080/api  # backend A
-curl -fsS http://127.0.0.1:8080/api  # backend B
-curl -fsS http://127.0.0.1:8080/     # 로컬 index.html
+curl -fsS http://127.0.0.1:8080/api/items  # backend A
+curl -fsS http://127.0.0.1:8080/api/items  # backend B
+curl -fsS http://127.0.0.1:8080/          # 로컬 index.html
 ```
 
 ## 동작 범위
@@ -83,3 +161,5 @@ done
 | 8 | 35,904 | 0 |
 | 32 | 41,927 | 0 |
 | 64 | 43,685 | 0 |
+
+</details>
