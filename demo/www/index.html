@@ -1,0 +1,154 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>cwebd demo</title>
+<style>
+body { font: 14px sans-serif; margin: 16px; }
+button { margin: 2px; }
+pre { background: #eee; padding: 8px; height: 280px; overflow: auto; }
+</style>
+
+<h3>기본</h3>
+<button id="t1">① 정적 파일</button>
+<button id="t2">② Round-Robin</button>
+<button id="t3">③ failover</button>
+<button id="t4">④ POST echo</button>
+<button id="all">⑤ 전체 실행</button>
+
+<h3>서버(백엔드) 다운</h3>
+<button id="e1">A·B 모두 다운 → 502</button>
+<button id="e2">느린 백엔드 → 504</button>
+수동:
+<button data-ctl="stop A">A 끄기</button>
+<button data-ctl="start A">A 켜기</button>
+<button data-ctl="stop B">B 끄기</button>
+<button data-ctl="start B">B 켜기</button>
+
+<h3>프록시 다운</h3>
+<button id="e3">프록시 다운 → 복구</button>
+<button data-ctl="stop proxy">프록시 끄기</button>
+<button data-ctl="start proxy">프록시 켜기</button>
+
+<h3>이상한 요청 (서버가 거절하는지)</h3>
+<span id="raws"></span>
+
+<p><button id="stat">상태 보기</button> <button id="clear">로그 지우기</button> (결과는 이 창과 F12 콘솔에 같이 나옵니다)</p>
+<pre id="log"></pre>
+
+<script>
+const CTRL = 'http://127.0.0.1:9000';
+const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function out(text, cls) {
+  console.log('%c' + text, cls === 'p' ? 'color:#1a7f37' : cls === 'f' ? 'color:#cf222e;font-weight:bold' : '');
+  $('log').textContent += text + '\n';
+  $('log').scrollTop = $('log').scrollHeight;
+}
+function report(name, pass, detail) {
+  out('[' + (pass ? 'PASS' : 'FAIL') + '] ' + name + ' - ' + detail, pass ? 'p' : 'f');
+  return pass;
+}
+async function ctl(path) { return (await fetch(CTRL + path)).json(); }
+async function get(url, opt) {
+  try {
+    const r = await fetch(url, Object.assign({ cache: 'no-store' }, opt));
+    return { status: r.status, text: await r.text() };
+  } catch (e) { return { error: String(e) }; }
+}
+const who = t => ((t || '').match(/backend (\w)/) || [])[1];
+async function ensure(...names) {
+  const s = await ctl('/status');
+  for (const n of names) if (!s[n]) await ctl('/start?name=' + n);
+}
+
+const T = {
+  async static() {
+    const a = await get('/index.html'), b = await get('/nope');
+    return report('정적 파일', a.status === 200 && b.status === 404, '/index.html=' + a.status + ', /nope=' + b.status);
+  },
+  async rr() {
+    await ensure('A', 'B');
+    const s = [];
+    for (let i = 0; i < 4; i++) { const r = await get('/api/x'); s.push(r.status === 200 ? who(r.text) : 'err' + (r.status || '')); }
+    const ok = s[0] !== s[1] && s[0] === s[2] && s[1] === s[3] && !s.join().includes('err');
+    return report('Round-Robin', ok, '응답 순서: ' + s.join(' → '));
+  },
+  async failover() {
+    await ensure('A', 'B');
+    await ctl('/stop?name=B');
+    const res = [];
+    for (let i = 0; i < 8; i++) res.push(await get('/api/x'));
+    await ctl('/start?name=B');
+    const ok = res.every(r => r.status === 200 && who(r.text) === 'A');
+    return report('failover (B 다운)', ok, 'B를 끈 뒤 8번 요청: ' + res.map(r => (r.status || 'err') + '/' + who(r.text)).join(' '));
+  },
+  async echo() {
+    const body = 'hello cwebd', r = await get('/echo', { method: 'POST', body });
+    return report('POST echo', r.status === 200 && r.text === body, '보낸 글자가 ' + (r.text === body ? '그대로 돌아옴' : '돌아오지 않음 (' + (r.status || r.error) + ')'));
+  },
+  async bothDown() {
+    await ensure('A', 'B');
+    await ctl('/stop?name=A'); await ctl('/stop?name=B');
+    const r = await get('/api/x');
+    await ctl('/start?name=A'); await ctl('/start?name=B');
+    return report('모든 백엔드 다운 → 502', r.status === 502, '응답 ' + (r.status || r.error));
+  },
+  async slow() {
+    await ensure('A');
+    const t0 = performance.now(), r = await get('/slow');
+    return report('느린 백엔드 → 504', r.status === 504, '응답 ' + (r.status || r.error) + ', ' + Math.round(performance.now() - t0) + 'ms 뒤 (타임아웃 2초)');
+  },
+  async proxyDown() {
+    await ensure('A', 'B', 'proxy');
+    await ctl('/stop?name=proxy');
+    const r = await get('/api/x'), s = await ctl('/status');
+    await ctl('/start?name=proxy');
+    const back = await get('/api/x');
+    const ok = !!r.error && s.A && s.B && back.status === 200;
+    return report('프록시 다운 → 복구', ok,
+      '다운 중 요청=' + (r.error ? '접속 실패' : r.status) + ', 백엔드 A/B 생존=' + s.A + '/' + s.B + ' (그래도 서비스 불가), 재시작 후=' + back.status);
+  },
+};
+
+const RAWS = [
+  ['garbage', '400', '쓰레기 요청'], ['nohost', '400', 'Host 없음'], ['traversal', '403', '경로 탈출 ../'],
+  ['longuri', '414', '너무 긴 주소'], ['chunked', '501', 'chunked 요청'], ['badver', '505', 'HTTP/9.9'], ['delete', '405', 'DELETE 메서드'],
+];
+async function raw(c, exp, label) {
+  const j = await ctl('/raw?case=' + c);
+  return report(label + ' → ' + exp, (j.line || '').startsWith('HTTP/1.1 ' + exp), j.line);
+}
+
+async function run(fn) {
+  try { return await fn(); } catch (e) { out('[ERROR] ' + e + '  (demo/run.sh 가 실행 중인지 확인)', 'f'); return false; }
+}
+async function all() {
+  const list = [T.static, T.rr, T.failover, T.echo, T.bothDown, T.slow, T.proxyDown, ...RAWS.map(r => () => raw(...r))];
+  let pass = 0;
+  for (const f of list) if (await run(f)) pass++;
+  out('=== 합격 ' + pass + ' / ' + list.length + ', 불합격 ' + (list.length - pass) + ' ===', pass === list.length ? 'p' : 'f');
+}
+
+$('t1').onclick = () => run(T.static);
+$('t2').onclick = () => run(T.rr);
+$('t3').onclick = () => run(T.failover);
+$('t4').onclick = () => run(T.echo);
+$('all').onclick = all;
+$('e1').onclick = () => run(T.bothDown);
+$('e2').onclick = () => run(T.slow);
+$('e3').onclick = () => run(T.proxyDown);
+$('stat').onclick = () => run(async () => out('상태: ' + JSON.stringify(await ctl('/status'))));
+$('clear').onclick = () => { $('log').textContent = ''; };
+document.querySelectorAll('[data-ctl]').forEach(b => {
+  b.onclick = () => run(async () => {
+    const [cmd, name] = b.dataset.ctl.split(' ');
+    out(b.textContent + ' → ' + JSON.stringify(await ctl('/' + cmd + '?name=' + name)));
+  });
+});
+RAWS.forEach(r => {
+  const b = document.createElement('button');
+  b.textContent = r[2] + ' → ' + r[1];
+  b.onclick = () => run(() => raw(...r));
+  $('raws').appendChild(b);
+});
+</script>
